@@ -1,14 +1,11 @@
-"""Minimal tool-using agent running against the local mimOE OpenAI-compatible endpoint.
+"""Tool-using agent running against the local mimOE OpenAI-compatible endpoint.
 
-Design: raw OpenAI-SDK calls (no agent framework) with a hybrid loop.
-SmolLM-360M is too small to follow a tool-calling protocol reliably (tested:
-native tool_calls and a TOOL:/ANSWER: text protocol both failed), so
-  1. plain code routes the question to a tool (calculator / clock),
-  2. the tool runs deterministically,
-  3. the local model turns the observation into the final natural-language
-     answer, or answers directly if no tool applies.
+Design: raw OpenAI-SDK calls (no agent framework) with native tool calling.
+The model (qwen3-1.7b) decides whether to answer directly or call a tool;
+the loop executes tool calls and feeds results back until it gives an answer.
 """
 import ast
+import json
 import operator
 import os
 import re
@@ -19,7 +16,8 @@ from openai import OpenAI
 
 BASE_URL = os.getenv("MIMOE_BASE_URL", "http://localhost:8083/mimik-ai/openai/v1")
 API_KEY = os.getenv("MIMOE_API_KEY", "1234")
-MODEL = os.getenv("MIMOE_MODEL", "smollm-360m")
+MODEL = os.getenv("MIMOE_MODEL", "qwen3-1.7b")
+MAX_STEPS = 5
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
@@ -39,61 +37,69 @@ def _eval(node):
     raise ValueError("unsupported expression")
 
 
-def calculator(expr: str) -> str:
+def calculator(expression: str) -> str:
     """Safe arithmetic evaluator (AST-based, no eval())."""
-    return str(_eval(ast.parse(expr.strip(), mode="eval").body))
+    return str(_eval(ast.parse(expression.strip(), mode="eval").body))
 
 
-def current_time(_: str = "") -> str:
+def current_time() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 TOOLS = {"calculator": calculator, "current_time": current_time}
 
-WORDS = {"times": "*", "multiplied by": "*", "plus": "+", "minus": "-",
-         "divided by": "/", "^": "**"}
-TIME_RE = re.compile(r"\b(time|date|today)\b", re.I)
-MATH_RE = re.compile(r"\d\s*([-+*/^%]|times|plus|minus|divided by|multiplied by)\s*\d", re.I)
+TOOL_SPECS = [
+    {"type": "function", "function": {
+        "name": "calculator",
+        "description": "Evaluate an arithmetic expression such as 12*(3+4). Use for any math.",
+        "parameters": {"type": "object",
+                       "properties": {"expression": {"type": "string"}},
+                       "required": ["expression"]}}},
+    {"type": "function", "function": {
+        "name": "current_time",
+        "description": "Get the current local date and time.",
+        "parameters": {"type": "object", "properties": {}}}},
+]
+
+SYSTEM = (
+    "You are a friendly, concise assistant. Answer greetings and general "
+    "questions directly in plain language. Only call a tool when it is needed: "
+    "use calculator for arithmetic and current_time for the date or time. "
+    "After a tool returns, state the result in a short sentence."
+)
+
+THINK_RE = re.compile(r"<think>.*?</think>", re.S)
 
 
-def extract_expr(q: str) -> str:
-    for word, sym in WORDS.items():
-        q = q.replace(word, sym)
-    return re.sub(r"[^0-9+\-*/().% ]", " ", q).strip()
-
-
-ROUTES = [(TIME_RE, "current_time", lambda q: ""),
-          (MATH_RE, "calculator", extract_expr)]
-
-SYSTEM = "You are a concise assistant. Answer in one or two sentences."
-
-
-def ask(prompt: str) -> str:
-    return client.chat.completions.create(
-        model=MODEL, temperature=0.1, max_tokens=80, stop=["\n\n"],
-        messages=[{"role": "system", "content": SYSTEM},
-                  {"role": "user", "content": prompt}],
-    ).choices[0].message.content.strip()
+def clean(text: str) -> str:
+    """Drop qwen3's <think> reasoning block (also an unterminated one)."""
+    text = THINK_RE.sub("", text or "")
+    return text.split("<think>")[0].strip()
 
 
 def run_agent(question: str, verbose: bool = True) -> str:
-    for pattern, name, to_input in ROUTES:
-        if pattern.search(question):
-            arg = to_input(question)
+    messages = [{"role": "system", "content": SYSTEM},
+                {"role": "user", "content": question}]
+    for _ in range(MAX_STEPS):
+        msg = client.chat.completions.create(
+            model=MODEL, messages=messages, tools=TOOL_SPECS,
+            temperature=0.3, max_tokens=800,
+        ).choices[0].message
+        if not msg.tool_calls:
+            return clean(msg.content) or "(no answer)"
+        messages.append({"role": "assistant", "content": msg.content or "",
+                         "tool_calls": [tc.model_dump() for tc in msg.tool_calls]})
+        for tc in msg.tool_calls:
+            name = tc.function.name
             try:
-                obs = TOOLS[name](arg)
-            except Exception as e:
+                args = json.loads(tc.function.arguments or "{}")
+                obs = TOOLS[name](**args) if name in TOOLS else f"unknown tool '{name}'"
+            except Exception as e:  # feed errors back so the model can recover
                 obs = f"error: {e}"
             if verbose:
-                print(f"[tool] {name}({arg!r}) -> {obs}")
-            fact = f"{arg} = {obs}" if arg else f"The current date and time is {obs}"
-            text = ask(f"Fact: {fact}.\nQuestion: {question}\n"
-                       "Answer the question in one short sentence using the fact.")
-            # a 360M model may garble the fact; always surface the grounded result
-            return text if obs in text else f"{text}\n(tool result: {fact})"
-    if verbose:
-        print("[tool] none -> answering directly")
-    return ask(question)
+                print(f"[tool] {name}({tc.function.arguments}) -> {obs}")
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(obs)})
+    return "Stopped: max steps reached without a final answer."
 
 
 if __name__ == "__main__":
